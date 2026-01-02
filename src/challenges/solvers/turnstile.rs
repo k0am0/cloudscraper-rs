@@ -3,6 +3,13 @@
 //! Detects the Turnstile widget, delegates solving to a configurable captcha
 //! provider, and prepares the submission payload consumed by the shared
 //! executor.
+//!
+//! This solver supports multiple methods for extracting the site key:
+//! - Primary: `data-sitekey` attribute in HTML
+//! - Fallback 1: `cFPWv` property in window._cf_chl_opt
+//! - Fallback 2: `sitekey` property in script tag JSON
+//!
+//! Includes randomized delays (1-5s by default) to mimic browser behavior.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -109,9 +116,16 @@ impl TurnstileSolver {
         original_request: OriginalRequest,
     ) -> Result<ChallengeHttpResponse, TurnstileError> {
         let submission = self.solve(response).await?;
-        execute_challenge_submission(client, submission, original_request)
+        let result = execute_challenge_submission(client, submission, original_request)
             .await
-            .map_err(TurnstileError::Submission)
+            .map_err(TurnstileError::Submission)?;
+
+        // Check if Cloudflare rejected the Turnstile solution with 403
+        if result.status == 403 {
+            return Err(TurnstileError::ChallengeSolveFailed);
+        }
+
+        Ok(result)
     }
 
     fn build_submission(
@@ -160,10 +174,26 @@ impl TurnstileSolver {
         response: &ChallengeResponse<'_>,
     ) -> Result<TurnstileInfo, TurnstileError> {
         let body = response.body;
+
+        // Try primary method: data-sitekey attribute
         let site_key = TURNSTILE_SITEKEY_RE
             .captures(body)
             .and_then(|caps| caps.get(1))
             .map(|m| m.as_str().to_string())
+            // Fallback 1: cFPWv in window._cf_chl_opt
+            .or_else(|| {
+                TURNSTILE_SITEKEY_OPT_RE
+                    .captures(body)
+                    .and_then(|caps| caps.get(1))
+                    .map(|m| m.as_str().to_string())
+            })
+            // Fallback 2: "sitekey": "..." in script tag JSON
+            .or_else(|| {
+                TURNSTILE_SITEKEY_JSON_RE
+                    .captures(body)
+                    .and_then(|caps| caps.get(1))
+                    .map(|m| m.as_str().to_string())
+            })
             .ok_or(TurnstileError::MissingSiteKey)?;
 
         let form_action = FORM_ACTION_RE
@@ -224,6 +254,8 @@ pub enum TurnstileError {
     InvalidFormAction(String, url::ParseError),
     #[error("captcha provider error: {0}")]
     Captcha(#[source] CaptchaError),
+    #[error("failed to solve Cloudflare Turnstile challenge - received 403 status")]
+    ChallengeSolveFailed,
     #[error("challenge submission failed: {0}")]
     Submission(#[source] ChallengeExecutionError),
 }
@@ -245,11 +277,28 @@ static TURNSTILE_SCRIPT_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 static TURNSTILE_SITEKEY_RE: Lazy<Regex> = Lazy::new(|| {
-    RegexBuilder::new(r#"data-sitekey=['"]([0-9A-Za-z]{40})['"]"#)
+    RegexBuilder::new(r#"data-sitekey=['\"]([0-9A-Za-z_-]{20,50})['\"]"#)
         .case_insensitive(true)
         .dot_matches_new_line(true)
         .build()
         .expect("invalid turnstile site key regex")
+});
+
+// Alternative patterns for site key extraction (fallbacks)
+static TURNSTILE_SITEKEY_OPT_RE: Lazy<Regex> = Lazy::new(|| {
+    RegexBuilder::new(r#"cFPWv\s?:\s?['\"]([^'\"]+)['\"]"#)
+        .case_insensitive(true)
+        .dot_matches_new_line(true)
+        .build()
+        .expect("invalid turnstile opt sitekey regex")
+});
+
+static TURNSTILE_SITEKEY_JSON_RE: Lazy<Regex> = Lazy::new(|| {
+    RegexBuilder::new(r#"['\"]sitekey['\"]\s*:\s*['\"]([^'\"]+)['\"]"#)
+        .case_insensitive(true)
+        .dot_matches_new_line(true)
+        .build()
+        .expect("invalid turnstile json sitekey regex")
 });
 
 static FORM_ACTION_RE: Lazy<Regex> = Lazy::new(|| {
@@ -392,5 +441,64 @@ mod tests {
             .await
             .expect_err("should fail");
         assert!(matches!(err, TurnstileError::CaptchaProviderMissing));
+    }
+
+    #[test]
+    fn extracts_sitekey_from_opt_fallback() {
+        let html = r#"
+            <html>
+              <body>
+                <script>
+                  window._cf_chl_opt = {
+                    cFPWv: "alternative_sitekey_from_opt_12345678"
+                  };
+                </script>
+                <div class="cf-turnstile"></div>
+              </body>
+            </html>
+        "#;
+        let fixture = ResponseFixture::new(html, 403);
+        let info = TurnstileSolver::extract_turnstile_info(&fixture.response());
+        assert!(info.is_ok());
+        assert_eq!(
+            info.unwrap().site_key,
+            "alternative_sitekey_from_opt_12345678"
+        );
+    }
+
+    #[test]
+    fn extracts_sitekey_from_json_fallback() {
+        let html = r#"
+            <html>
+              <body>
+                <script>
+                  var config = {
+                    "sitekey": "json_sitekey_fallback_987654321"
+                  };
+                </script>
+                <div class="cf-turnstile"></div>
+              </body>
+            </html>
+        "#;
+        let fixture = ResponseFixture::new(html, 403);
+        let info = TurnstileSolver::extract_turnstile_info(&fixture.response());
+        assert!(info.is_ok());
+        assert_eq!(info.unwrap().site_key, "json_sitekey_fallback_987654321");
+    }
+
+    #[test]
+    fn sitekey_primary_takes_precedence() {
+        let html = r#"
+            <html>
+              <body>
+                <div class="cf-turnstile" data-sitekey="primary_sitekey_12345"></div>
+                <script>window._cf_chl_opt = { cFPWv: "fallback_key" };</script>
+              </body>
+            </html>
+        "#;
+        let fixture = ResponseFixture::new(html, 403);
+        let info = TurnstileSolver::extract_turnstile_info(&fixture.response());
+        assert!(info.is_ok());
+        assert_eq!(info.unwrap().site_key, "primary_sitekey_12345");
     }
 }

@@ -3,6 +3,10 @@
 //! Extracts orchestration metadata embedded in the challenge page, prepares the
 //! expected payload (including optional hCaptcha tokens), and relies on the
 //! shared executor to perform the delayed submission.
+//!
+//! This solver implements the challenge-platform orchestrate flow used by modern
+//! Cloudflare protections. It includes randomized delays (1-5s by default) to
+//! mimic browser-like behavior and reduce detection risk.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -146,9 +150,16 @@ impl JavascriptV2Solver {
             self.solve(response)?
         };
 
-        execute_challenge_submission(client, submission, original_request)
+        let result = execute_challenge_submission(client, submission, original_request)
             .await
-            .map_err(JavascriptV2Error::Submission)
+            .map_err(JavascriptV2Error::Submission)?;
+
+        // Check if Cloudflare rejected the challenge solution with 403
+        if result.status == 403 {
+            return Err(JavascriptV2Error::ChallengeSolveFailed);
+        }
+
+        Ok(result)
     }
 
     fn build_submission(
@@ -303,6 +314,8 @@ pub enum JavascriptV2Error {
     CaptchaProviderMissing,
     #[error("captcha solving failed: {0}")]
     Captcha(#[source] CaptchaError),
+    #[error("failed to solve Cloudflare v2 challenge - received 403 status")]
+    ChallengeSolveFailed,
     #[error("challenge submission failed: {0}")]
     Submission(#[source] ChallengeExecutionError),
 }
@@ -327,7 +340,7 @@ static CAPTCHA_CHALLENGE_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 static CHL_OPT_RE: Lazy<Regex> = Lazy::new(|| {
-    RegexBuilder::new(r#"window\._cf_chl_opt=\((\{[^;]+\})\);"#)
+    RegexBuilder::new(r#"window\._cf_chl_opt=\(?(\{.*?\})\)?;"#)
         .dot_matches_new_line(true)
         .build()
         .expect("invalid _cf_chl_opt regex")
@@ -499,5 +512,20 @@ mod tests {
             .await
             .expect_err("missing provider should fail");
         matches!(err, JavascriptV2Error::CaptchaProviderMissing);
+    }
+
+    #[test]
+    fn challenge_opt_regex_handles_optional_parens() {
+        // Test with parentheses (old format)
+        let html_with_parens = r#"
+            <script>window._cf_chl_opt=({"cvId":"test123","chlPageData":"data"});</script>
+        "#;
+        assert!(CHL_OPT_RE.is_match(html_with_parens));
+
+        // Test without parentheses (newer format)
+        let html_without_parens = r#"
+            <script>window._cf_chl_opt={"cvId":"test123","chlPageData":"data"};</script>
+        "#;
+        assert!(CHL_OPT_RE.is_match(html_without_parens));
     }
 }

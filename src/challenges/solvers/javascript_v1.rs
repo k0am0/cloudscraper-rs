@@ -3,6 +3,9 @@
 //! Parses the challenge page, evaluates the embedded JavaScript snippet via the
 //! provided interpreter, and produces the submission payload the caller must
 //! POST back to Cloudflare.
+//!
+//! This implementation includes detection for both legacy IUAM challenges and
+//! newer challenge-platform orchestrate variants used by Cloudflare.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +39,20 @@ impl JavascriptV1Solver {
             && matches!(response.status, 429 | 503)
             && response.body.contains("/cdn-cgi/images/trace/jsch/")
             && parse_iuam_challenge(response).is_ok()
+    }
+
+    /// Returns `true` if the response is a newer IUAM challenge using challenge-platform orchestrate.
+    pub fn is_new_iuam_challenge(&self, response: &ChallengeResponse<'_>) -> bool {
+        static NEW_IUAM_RE: Lazy<Regex> = Lazy::new(|| {
+            RegexBuilder::new(
+                r#"cpo\.src\s*=\s*['\"/]+cdn-cgi/challenge-platform/\S+orchestrate/jsch/v1"#,
+            )
+            .case_insensitive(true)
+            .build()
+            .unwrap()
+        });
+
+        self.is_iuam_challenge(response) && NEW_IUAM_RE.is_match(response.body)
     }
 
     /// Returns `true` if Cloudflare responded with a captcha challenge.
@@ -145,6 +162,10 @@ pub enum JavascriptV1Error {
     Parse(ChallengeParseError),
     #[error("challenge submission failed: {0}")]
     Submission(ChallengeExecutionError),
+    #[error(
+        "cloudflare returned invalid response (status 400) - challenge answer may be incorrect"
+    )]
+    InvalidResponse,
 }
 
 #[cfg(test)]
@@ -314,5 +335,58 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, 200);
+    }
+
+    #[test]
+    fn detects_new_iuam_challenge() {
+        let html = r#"
+            <html>
+              <body>
+                <form id='challenge-form' action='/cdn-cgi/l/chk_jschl?__cf_chl_f_tk=foo' method='POST'>
+                  <input type='hidden' name='r' value='abc'/>
+                  <input type='hidden' name='jschl_vc' value='def'/>
+                  <input type='hidden' name='pass' value='ghi'/>
+                </form>
+                <script>
+                  cpo.src = '/cdn-cgi/challenge-platform/h/g/orchestrate/jsch/v1?ray=abc';
+                </script>
+                <script>setTimeout(function(){ submit();
+                }, 4000);</script>
+                <script src='/cdn-cgi/images/trace/jsch/'></script>
+              </body>
+            </html>
+        "#;
+
+        let solver = JavascriptV1Solver::new(Arc::new(StubInterpreter));
+        let fixture = ResponseFixture::new(html, 503);
+        let resp = fixture.response();
+
+        assert!(solver.is_iuam_challenge(&resp));
+        assert!(solver.is_new_iuam_challenge(&resp));
+    }
+
+    #[test]
+    fn detects_old_iuam_challenge_not_new() {
+        let html = r#"
+            <html>
+              <body>
+                <form id='challenge-form' action='/cdn-cgi/l/chk_jschl?__cf_chl_f_tk=foo' method='POST'>
+                  <input type='hidden' name='r' value='abc'/>
+                  <input type='hidden' name='jschl_vc' value='def'/>
+                  <input type='hidden' name='pass' value='ghi'/>
+                </form>
+                <script>setTimeout(function(){ submit();
+                }, 4000);</script>
+                <script src='/cdn-cgi/images/trace/jsch/'></script>
+              </body>
+            </html>
+        "#;
+
+        let solver = JavascriptV1Solver::new(Arc::new(StubInterpreter));
+        let fixture = ResponseFixture::new(html, 503);
+        let resp = fixture.response();
+
+        assert!(solver.is_iuam_challenge(&resp));
+        assert!(!solver.is_new_iuam_challenge(&resp));
     }
 }

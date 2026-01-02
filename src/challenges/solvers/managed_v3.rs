@@ -2,6 +2,11 @@
 //!
 //! Executes the embedded JavaScript VM payload and applies fallback strategies
 //! when full execution is not possible.
+//!
+//! This solver handles the most sophisticated Cloudflare challenges that use
+//! JavaScript VM execution with context data (_cf_chl_ctx and _cf_chl_opt).
+//! It includes randomized delays (1-5s by default) and intelligent fallback
+//! mechanisms for when VM execution fails.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -90,9 +95,16 @@ impl ManagedV3Solver {
         original_request: OriginalRequest,
     ) -> Result<ChallengeHttpResponse, ManagedV3Error> {
         let submission = self.solve(response)?;
-        execute_challenge_submission(client, submission, original_request)
+        let result = execute_challenge_submission(client, submission, original_request)
             .await
-            .map_err(ManagedV3Error::Submission)
+            .map_err(ManagedV3Error::Submission)?;
+
+        // Check if Cloudflare rejected the v3 challenge solution with 403
+        if result.status == 403 {
+            return Err(ManagedV3Error::ChallengeSolveFailed);
+        }
+
+        Ok(result)
     }
 
     fn execute_vm(
@@ -129,6 +141,7 @@ impl ManagedV3Solver {
             window.self = window;
             window.top = window;
             window.parent = window;
+            window.frames = window;
             window.setTimeout = window.setTimeout || function(fn) {{ return fn(); }};
             window.clearTimeout = window.clearTimeout || function() {{ return true; }};
             window.addEventListener = window.addEventListener || function() {{ return true; }};
@@ -293,11 +306,19 @@ impl ManagedV3Solver {
     }
 
     fn extract_vm_script(body: &str) -> Option<String> {
-        let enter_idx = body.find("window._cf_chl_enter")?;
-        let script_open = body[..enter_idx].rfind("<script")?;
-        let content_start = body[script_open..].find('>')? + script_open + 1;
-        let script_close = body[enter_idx..].find("</script>")? + enter_idx;
-        Some(body[content_start..script_close].trim().to_string())
+        // Try to find script containing window._cf_chl_enter
+        static VM_SCRIPT_RE: Lazy<Regex> = Lazy::new(|| {
+            RegexBuilder::new(r"<script[^>]*>\s*(.*?window\._cf_chl_enter.*?)</script>")
+                .case_insensitive(true)
+                .dot_matches_new_line(true)
+                .build()
+                .expect("invalid vm script regex")
+        });
+
+        VM_SCRIPT_RE
+            .captures(body)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().trim().to_string())
     }
 
     fn generate_payload(
@@ -364,6 +385,8 @@ pub enum ManagedV3Error {
     InvalidFormAction(String, url::ParseError),
     #[error("javascript interpreter error: {0}")]
     Interpreter(#[source] InterpreterError),
+    #[error("failed to solve Cloudflare v3 challenge - received 403 status")]
+    ChallengeSolveFailed,
     #[error("challenge submission failed: {0}")]
     Submission(#[source] ChallengeExecutionError),
     #[error("json parse error: {0}")]
@@ -529,5 +552,52 @@ mod tests {
         let solver = ManagedV3Solver::new(Arc::new(StubInterpreter));
         let submission = solver.solve(&fixture.response()).expect("fallback works");
         assert!(submission.form_fields.contains_key("jschl_answer"));
+    }
+
+    #[test]
+    fn json_extraction_handles_nested_objects() {
+        let html = r#"
+            <script>
+            window._cf_chl_ctx = {
+                "cvId": "test123",
+                "nested": {
+                    "key": "value",
+                    "inner": {"deep": "data"}
+                },
+                "array": [1, 2, 3]
+            };
+            </script>
+        "#;
+
+        let result = ManagedV3Solver::extract_json_block(html, "window._cf_chl_ctx");
+        assert!(result.is_ok());
+        let json = result.unwrap();
+        assert!(json.is_some());
+        let parsed: serde_json::Value = serde_json::from_str(&json.unwrap()).unwrap();
+        assert_eq!(parsed["cvId"], "test123");
+    }
+
+    #[test]
+    fn extracts_all_input_fields() {
+        let html = r#"
+            <form id="challenge-form" action="/test?__cf_chl_rt_tk=foo">
+                <input type="hidden" name="r" value="r-token"/>
+                <input type="hidden" name="cf_chl_seq_i" value="2"/>
+                <input type="hidden" name="custom_field" value="custom_value"/>
+            </form>
+            <script>window._cf_chl_ctx={};</script>
+            <script>window._cf_chl_opt={};</script>
+        "#;
+
+        let result = ManagedV3Solver::generate_payload(html, "answer123");
+        assert!(result.is_ok());
+        let payload = result.unwrap();
+        assert_eq!(payload.get("r"), Some(&"r-token".to_string()));
+        assert_eq!(payload.get("jschl_answer"), Some(&"answer123".to_string()));
+        assert_eq!(payload.get("cf_chl_seq_i"), Some(&"2".to_string()));
+        assert_eq!(
+            payload.get("custom_field"),
+            Some(&"custom_value".to_string())
+        );
     }
 }
