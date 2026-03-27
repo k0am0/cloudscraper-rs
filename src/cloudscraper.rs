@@ -130,20 +130,12 @@ impl ScraperResponse {
 
     /// Response cookies.
     pub fn cookies(&self) -> Vec<Cookie<'static>> {
-        let mut out = Vec::new();
-
-        for val in self.headers.get_all("set-cookie") {
-            if let Ok(raw) = val.to_str() {
-                if let Some((name, rest)) = raw.split_once('=') {
-                    let value = rest.split(';').next().unwrap_or("");
-                    let cookie = Cookie::build((name.to_string(), value.to_string())).build();
-
-                    out.push(cookie);
-                }
-            }
-        }
-
-        out
+        self.headers
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|val| val.to_str().ok())
+            .filter_map(|s| Cookie::parse_encoded(s.to_string()).ok())
+            .collect()
     }
 }
 
@@ -479,13 +471,9 @@ impl CloudScraper {
     }
 
     /// Perform an HTTP GET request.
-    pub async fn get(
-        &self,
-        url: &str,
-        custom_headers: Option<HeaderMap>,
-    ) -> CloudScraperResult<ScraperResponse> {
+    pub async fn get(&self, url: &str) -> CloudScraperResult<ScraperResponse> {
         let url = Url::parse(url)?;
-        self.request(Method::GET, url, None, custom_headers).await
+        self.request(Method::GET, url, None).await
     }
 
     /// Perform an arbitrary HTTP request.
@@ -494,15 +482,12 @@ impl CloudScraper {
         method: Method,
         url: Url,
         body: Option<Vec<u8>>,
-        custom_headers: Option<HeaderMap>,
     ) -> CloudScraperResult<ScraperResponse> {
         let mut forced_proxy: Option<String> = None;
         let mut attempt = 0usize;
 
         loop {
             attempt += 1;
-
-            let custom_headers = custom_headers.clone();
 
             let (mut headers_http, anti_ctx, proxy, mut delay) = self
                 .prepare_request(
@@ -512,12 +497,6 @@ impl CloudScraper {
                     forced_proxy.take(),
                 )
                 .await?;
-
-            if let Some(h) = custom_headers {
-                for (n, v) in h.iter() {
-                    headers_http.insert(n.clone(), v.clone());
-                }
-            }
 
             if let Some(ref ct) = self.config.content_type {
                 headers_http.insert(
