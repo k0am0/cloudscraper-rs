@@ -130,12 +130,20 @@ impl ScraperResponse {
 
     /// Response cookies.
     pub fn cookies(&self) -> Vec<Cookie<'static>> {
-        self.headers
-            .get_all(SET_COOKIE)
-            .iter()
-            .filter_map(|val| val.to_str().ok())
-            .filter_map(|s| Cookie::parse_encoded(s.to_string()).ok())
-            .collect()
+        let mut out = Vec::new();
+
+        for val in self.headers.get_all("set-cookie") {
+            if let Ok(raw) = val.to_str() {
+                if let Some((name, rest)) = raw.split_once('=') {
+                    let value = rest.split(';').next().unwrap_or("");
+                    let cookie = Cookie::build((name.to_string(), value.to_string())).build();
+
+                    out.push(cookie);
+                }
+            }
+        }
+
+        out
     }
 }
 
