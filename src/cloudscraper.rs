@@ -130,11 +130,12 @@ impl ScraperResponse {
 
     /// Response cookies.
     pub fn cookies(&self) -> Vec<Cookie<'static>> {
+        // Works. But, maybe there is a better way.. I don't know lol...
         self.headers
             .get_all(SET_COOKIE)
             .iter()
             .filter_map(|val| val.to_str().ok())
-            .filter_map(|s| Cookie::parse_encoded(s.to_string()).ok())
+            .filter_map(|s| Cookie::parse(s.to_string()).ok())
             .collect()
     }
 }
