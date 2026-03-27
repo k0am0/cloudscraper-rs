@@ -134,7 +134,7 @@ impl ScraperResponse {
             .get_all(SET_COOKIE)
             .iter()
             .filter_map(|val| val.to_str().ok())
-            .filter_map(|s| Cookie::parse(s.to_string()).ok())
+            .filter_map(|s| Cookie::parse_encoded(s.to_string()).ok())
             .collect()
     }
 }
